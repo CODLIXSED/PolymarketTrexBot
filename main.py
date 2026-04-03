@@ -1,295 +1,201 @@
-import requests
-import os
-import sqlite3
-import pandas as pd
-import numpy as np
+import requests, os, sqlite3, pandas as pd, numpy as np, subprocess, time
 from sklearn.ensemble import RandomForestClassifier
-import subprocess
 from flask import Flask, jsonify
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-DB_FILE = "data.db"
+DB = "data.db"
 
 # ================= TELEGRAM =================
 def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  json={"chat_id": CHAT_ID, "text": msg})
 
 # ================= DATABASE =================
-def connect():
-    return sqlite3.connect(DB_FILE)
+def db():
+    return sqlite3.connect(DB)
 
-def create_tables():
-    conn = connect()
-    c = conn.cursor()
+def init_db():
+    c = db().cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS market(market TEXT, price REAL, ts DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS trades(market TEXT, signal TEXT, conf REAL, result REAL DEFAULT 0, ts DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    db().commit()
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS market_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        market TEXT,
-        price REAL,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+def save_price(m,p):
+    c=db().cursor(); c.execute("INSERT INTO market VALUES(?,?,CURRENT_TIMESTAMP)",(m,p)); db().commit()
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        market TEXT,
-        signal TEXT,
-        confidence REAL,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+def get_hist(m):
+    return pd.read_sql(f"SELECT price FROM market WHERE market='{m}' ORDER BY ts DESC LIMIT 120", db())[::-1]
 
-    conn.commit()
-    conn.close()
+def save_trade(m,s,c):
+    db().cursor().execute("INSERT INTO trades(market,signal,conf) VALUES(?,?,?)",(m,s,c)); db().commit()
 
-def save_price(market, price):
-    conn = connect()
-    c = conn.cursor()
-    c.execute("INSERT INTO market_data (market, price) VALUES (?, ?)", (market, price))
-    conn.commit()
-    conn.close()
-
-def get_history(market):
-    conn = connect()
-    df = pd.read_sql(f"""
-        SELECT price FROM market_data
-        WHERE market = '{market}'
-        ORDER BY timestamp DESC
-        LIMIT 100
-    """, conn)
-    return df[::-1]
-
-def save_trade(market, signal, conf):
-    conn = connect()
-    c = conn.cursor()
-    c.execute("INSERT INTO trades (market, signal, confidence) VALUES (?, ?, ?)", (market, signal, conf))
-    conn.commit()
-    conn.close()
+def stats():
+    df=pd.read_sql("SELECT * FROM trades",db())
+    if len(df)==0: return 0,0
+    return len(df), round(df["result"].mean(),4)
 
 # ================= MARKET =================
-def get_markets():
-    url = "https://gamma-api.polymarket.com/markets"
-    data = requests.get(url).json()
-
-    markets = []
-    for m in data[:10]:
+def markets():
+    data=requests.get("https://gamma-api.polymarket.com/markets").json()
+    out=[]
+    for m in data[:12]:
         try:
-            markets.append({
-                "price": float(m.get("lastTradePrice", 0.5)),
-                "name": m.get("question", "Unknown"),
-                "id": m.get("id")
-            })
-        except:
-            continue
-    return markets
+            out.append((m["question"],float(m.get("lastTradePrice",0.5)),m["id"]))
+        except: pass
+    return out
 
 # ================= ORDERBOOK =================
-def get_orderbook(market_id):
+def imbalance(id):
     try:
-        return requests.get(f"https://clob.polymarket.com/orderbook/{market_id}").json()
-    except:
-        return {}
+        ob=requests.get(f"https://clob.polymarket.com/orderbook/{id}").json()
+        b=sum(float(x[1]) for x in ob.get("bids",[])[:10])
+        a=sum(float(x[1]) for x in ob.get("asks",[])[:10])
+        return (b-a)/(b+a+1e-6)
+    except: return 0
 
-def analyze_orderbook(ob):
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
-
-    bid_vol = sum([float(b[1]) for b in bids[:10]]) if bids else 0
-    ask_vol = sum([float(a[1]) for a in asks[:10]]) if asks else 0
-
-    return (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-6)
-
-# ================= MACRO REAL API =================
-def macro_bias():
+# ================= MACRO REAL =================
+def macro():
     try:
-        # contoh: pakai data USD index proxy (BTC sebagai risk proxy)
-        btc = requests.get("https://api.coindesk.com/v1/bpi/currentprice.json").json()
-        price = float(btc["bpi"]["USD"]["rate"].replace(",", ""))
-
-        if price > 30000:
-            return "RISK_ON"
-        else:
-            return "RISK_OFF"
-    except:
-        return "NEUTRAL"
-
-def macro_filter(signal, bias):
-    if bias == "RISK_OFF" and signal == "BUY":
-        return False
-    return True
+        btc=float(requests.get("https://api.coindesk.com/v1/bpi/currentprice.json")
+                  .json()["bpi"]["USD"]["rate"].replace(",",""))
+        return "RISK_ON" if btc>30000 else "RISK_OFF"
+    except: return "NEUTRAL"
 
 # ================= FEATURE =================
-def prepare_ml_data(df):
-    df = df.copy()
+def features(df):
+    df["ret"]=df.price.pct_change()
+    df["mom"]=df.ret.rolling(5).mean()
+    df["vol"]=df.ret.rolling(5).std()
+    df["ema9"]=df.price.ewm(span=9).mean()
+    df["ema21"]=df.price.ewm(span=21).mean()
 
-    df["return"] = df["price"].pct_change()
-    df["momentum"] = df["return"].rolling(5).mean()
-    df["volatility"] = df["return"].rolling(5).std()
+    delta=df.price.diff()
+    gain=delta.clip(lower=0).rolling(14).mean()
+    loss=-delta.clip(upper=0).rolling(14).mean()
+    rs=gain/(loss+1e-6)
+    df["rsi"]=100-(100/(1+rs))
 
-    mean = df["price"].rolling(20).mean()
-    std = df["price"].rolling(20).std()
-    df["zscore"] = (df["price"] - mean) / std
+    df=df.dropna()
+    if len(df)<20: return None
 
-    df["future"] = df["price"].shift(-3)
-    df["target"] = (df["future"] > df["price"]).astype(int)
-
-    df = df.dropna()
-
-    X = df[["momentum", "volatility", "zscore"]]
-    y = df["target"]
-
-    return X, y
-
-def train_model(df):
-    X, y = prepare_ml_data(df)
-
-    if len(X) < 20:
-        return None
-
-    model = RandomForestClassifier(n_estimators=100)
-    model.fit(X, y)
-
-    return model
-
-def extract_features(df):
-    df["return"] = df["price"].pct_change()
-    df["momentum"] = df["return"].rolling(5).mean()
-    df["volatility"] = df["return"].rolling(5).std()
-
-    mean = df["price"].rolling(20).mean()
-    std = df["price"].rolling(20).std()
-    df["zscore"] = (df["price"] - mean) / std
-
-    latest = df.iloc[-1]
-
+    last=df.iloc[-1]
     return [
-        float(latest["momentum"] or 0),
-        float(latest["volatility"] or 0),
-        float(latest["zscore"] or 0)
+        last["mom"], last["vol"], last["rsi"],
+        last["ema9"]-last["ema21"]
     ]
 
-def predict(model, features):
-    if model is None:
-        return "WAIT", 0
+# ================= ML =================
+def train(df):
+    df=df.copy()
+    df["future"]=df.price.shift(-3)
+    df["y"]=(df.future>df.price).astype(int)
+    df=df.dropna()
 
-    pred = model.predict([features])[0]
-    prob = max(model.predict_proba([features])[0])
+    if len(df)<30: return None
 
-    if prob < 0.6:
-        return "NO TRADE", prob * 100
+    X=np.column_stack([
+        df.price.pct_change().fillna(0),
+        df.price.rolling(5).std().fillna(0),
+        df.price.rolling(10).mean().fillna(0)
+    ])
+    y=df["y"]
 
-    return ("BUY", prob * 100) if pred == 1 else ("SELL", prob * 100)
+    m=RandomForestClassifier(n_estimators=120)
+    m.fit(X,y)
+    return m
+
+def predict(m,feat):
+    if m is None or feat is None: return "WAIT",0
+    p=m.predict([feat])[0]
+    prob=max(m.predict_proba([feat])[0])
+    if prob<0.65: return "NO TRADE",prob*100
+    return ("BUY",prob*100) if p==1 else ("SELL",prob*100)
 
 # ================= RISK =================
-def risk_management(price, signal):
-    risk = 0.02
-
-    if signal == "BUY":
-        sl = price * (1 - risk)
-        tp = price * (1 + risk * 2)
+def risk(price,s):
+    r=0.02
+    if s=="BUY":
+        return price*(1-r), price*(1+r*2)
     else:
-        sl = price * (1 + risk)
-        tp = price * (1 - risk * 2)
+        return price*(1+r), price*(1-r*2)
 
-    return sl, tp
+# ================= FILTER =================
+def valid(signal,conf,imb,macro):
+    if signal in ["WAIT","NO TRADE"]: return False
+    if conf<65: return False
+    if abs(imb)<0.05: return False
+    if macro=="RISK_OFF" and signal=="BUY": return False
+    return True
 
 # ================= SAVE DB =================
-def save_db():
+def save_repo():
     try:
-        subprocess.run(["git", "config", "--global", "user.email", "bot@bot.com"])
-        subprocess.run(["git", "config", "--global", "user.name", "bot"])
-
-        subprocess.run(["git", "add", DB_FILE])
-        subprocess.run(["git", "commit", "-m", "update db"], check=False)
-        subprocess.run(["git", "push"])
-    except:
-        pass
+        subprocess.run(["git","config","--global","user.email","bot@bot.com"])
+        subprocess.run(["git","config","--global","user.name","bot"])
+        subprocess.run(["git","add",DB])
+        subprocess.run(["git","commit","-m","update"],check=False)
+        subprocess.run(["git","push"])
+    except: pass
 
 # ================= DASHBOARD =================
-app = Flask(__name__)
-
+app=Flask(__name__)
 @app.route("/")
-def dashboard():
-    conn = connect()
-    df = pd.read_sql("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+def dash():
+    df=pd.read_sql("SELECT * FROM trades ORDER BY ts DESC LIMIT 30",db())
     return df.to_html()
 
 @app.route("/api")
 def api():
-    conn = connect()
-    df = pd.read_sql("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+    df=pd.read_sql("SELECT * FROM trades ORDER BY ts DESC LIMIT 30",db())
     return jsonify(df.to_dict(orient="records"))
 
 # ================= MAIN =================
-def run_bot():
-    create_tables()
+def run():
+    init_db()
+    mkts=markets()
+    bias=macro()
 
-    markets = get_markets()
-    bias = macro_bias()
+    best=[]
 
-    best = None
-    best_score = 0
+    for name,price,id in mkts:
+        save_price(name,price)
+        df=get_hist(name)
+        if len(df)<30: continue
 
-    for m in markets:
-        price = m["price"]
-        market = m["name"]
-        market_id = m["id"]
+        feat=features(df)
+        imb=imbalance(id)
 
-        save_price(market, price)
+        model=train(df)
+        sig,conf=predict(model,feat)
 
-        df = get_history(market)
-        if len(df) < 20:
-            continue
+        if not valid(sig,conf,imb,bias): continue
 
-        features = extract_features(df)
+        score=conf+abs(imb*100)
+        best.append((score,name,price,sig,conf,imb))
 
-        ob = get_orderbook(market_id)
-        imbalance = analyze_orderbook(ob)
-        features.append(imbalance)
-
-        model = train_model(df)
-        signal, conf = predict(model, features)
-
-        if signal in ["NO TRADE", "WAIT"]:
-            continue
-
-        if not macro_filter(signal, bias):
-            continue
-
-        score = conf + abs(imbalance * 100)
-
-        if score > best_score:
-            best_score = score
-            best = (market, price, signal, conf, imbalance)
+    best=sorted(best,reverse=True)[:3]
 
     if best:
-        market, price, signal, conf, imbalance = best
-        sl, tp = risk_management(price, signal)
-
-        msg = f"""
-🔥 BEST SIGNAL
-
-📊 {market}
-💰 Entry: {price:.2f}
-🚀 {signal}
-🎯 {conf:.2f}%
-
-🛑 SL: {sl:.2f}
-🎯 TP: {tp:.2f}
-
-🌍 Macro: {bias}
+        msg="🔥 TOP SIGNALS\n"
+        for i,(s,n,p,sg,c,imb) in enumerate(best,1):
+            sl,tp=risk(p,sg)
+            msg+=f"""
+#{i} {n}
+{sg} | {c:.1f}%
+Entry {p:.2f}
+SL {sl:.2f} | TP {tp:.2f}
+OB {imb:.2f}
 """
-        send(msg)
-        save_trade(market, signal, conf)
+            save_trade(n,sg,c)
     else:
-        send("😴 Tidak ada peluang valid")
+        msg="😴 No high-quality trades"
 
-    save_db()
+    t,wr=stats()
+    msg+=f"\n📊 Trades: {t} | Avg: {wr}"
 
-# run bot
-if __name__ == "__main__":
-    run_bot()
+    send(msg)
+    save_repo()
+
+if __name__=="__main__":
+    run()
